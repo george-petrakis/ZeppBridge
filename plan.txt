@@ -1,0 +1,931 @@
+# ZeppBridge：本地优先 Zepp 健康数据桥架构与 MVP 计划
+
+## 1. 项目定位与可行性结论
+
+ZeppBridge 的目标，是做一个“本地优先、模块化、可被 AI 访问”的 Zepp 健康数据桥。
+
+核心链路：
+
+Zepp / Amazfit 设备
+→ Zepp 数据源
+→ 本地同步与标准化
+→ SQLite 保存最近约 30 天
+→ Dashboard 可视化
+→ REST / MCP 提供给 AI 使用
+
+当前个人设备组合：
+
+- Helio Strap：日常、睡眠与恢复数据为主
+- T-Rex 3：运动、GPS 与训练数据为主
+
+### 可行性判断
+
+- **核心健康数据具备较高可行性**：心率、静息心率、HRV、睡眠、血氧、压力、步数、运动记录、GPS、VO₂max、训练负荷、Readiness、BioCharge 等，现有非官方客户端已经验证多条 Zepp App 私有移动 API，可作为实现参考。[zepp-health-cli](https://github.com/m4ary/zepp-health-cli)
+- **多设备融合具有明确产品依据**：Zepp App 会处理多设备产生的数据，因此 ZeppBridge 应优先寻找 Zepp 已经处理好的用户级结果，而不是自行把 Helio Strap 与 T-Rex 3 的日常数据相加。[Amazfit 多设备同步说明](https://us.amazfit.com/blogs/product-update/amazfit-balance-series-software-update-smarter-training-navigation-and-health-insights)
+- **HybridCharge 暂时视为待验证能力**：如果能从真实账号中找到与 App 对应的数据，就纳入；如果暂时找不到，标记为 `unverified`，不阻塞其他指标开发。[HybridCharge 官方定义](https://eu.amazfit.com/blogs/product-updates/amazfit-balance-series-software-update-smarter-training-navigation-and-health-insights)
+- **正式 Zepp Open API / OAuth 不作为 MVP 前提**：当前官方接入仍有 App ID、包名、签名等限制，因此个人 MVP 优先使用已验证的 Zepp 私有云读取方案。[旧 Open API](https://github.com/zepp-health/rest-api)、[OAuth 接入须知](https://github.com/zepp-health/oauth-Android-sdk/blob/a43a46bedf9aea5ebe3bce8cdb2e4bed54d275c8/Docs/%E6%8E%A5%E5%85%A5%E9%A1%BB%E7%9F%A5.md)
+- **Gadgetbridge 是未来的原始数据源**：适合补充设备级数据和本地备份，但不承担 Zepp 官方融合结果与专有派生指标的主源职责。[Gadgetbridge Zepp OS 支持矩阵](https://gadgetbridge.org/basics/topics/zeppos/)
+- **Health Connect 是未来补充源**：适合通用 Android 健康数据，但不承担完整 Zepp 数据主源职责。[Google Health 的 Zepp 数据边界](https://support.google.com/googlehealth/answer/14236613?hl=en)
+
+### 总体原则
+
+1. **本地优先**：健康数据默认只保存在本机，不依赖自建云服务。
+2. **Zepp 用户级结果优先**：如果 Zepp 已经完成多设备融合，直接保存和使用，不重复计算。
+3. **模块化**：认证、数据获取、标准化、同步、存储、Dashboard、REST、MCP 彼此解耦。
+4. **SQLite 优先**：30 天个人健康数据规模很小，不引入复杂数据库系统。
+5. **快速 MVP**：先让真实 Zepp 数据进入本地数据库并显示出来，再逐步补高级指标与发布工程。
+6. **能力渐进**：某个指标暂时 unavailable / unverified，不阻塞整个产品。
+7. **适配器思路**：以后更换 Zepp 接口或增加 Gadgetbridge、Health Connect 时，不重写 Dashboard 和 AI 层。
+
+---
+
+## 2. 总体架构
+
+```mermaid
+flowchart LR
+    Z["Zepp Cloud<br/>MVP 主数据源"] --> A["Zepp Adapter"]
+    E["Zepp 官方归档<br/>未来兜底"] --> S["Source Adapters"]
+    H["Health Connect<br/>未来补充"] --> S
+    G["Gadgetbridge<br/>未来 Raw 源"] --> S
+
+    A --> F["Data Fetcher"]
+    S --> F
+
+    F --> R["Raw Cache"]
+    R --> N["Normalizer"]
+    N --> D["SQLite<br/>最近 30 天"]
+
+    SCH["Sync Scheduler"] --> F
+
+    D --> UI["Tauri Dashboard"]
+    D --> API["Local REST API"]
+    D --> MCP["Local MCP Server"]
+```
+
+这套结构吸收“简单模块化”的思路，正式项目只保留几个清晰模块：
+
+### `auth`
+
+负责：
+
+- Zepp token / session 导入
+- user_id 与 region_host
+- token 到期检测
+- 重新授权状态
+
+不保存 Zepp 密码。
+
+### `connectors`
+
+负责：
+
+- Zepp Cloud API
+- endpoint 与参数
+- capability 探测
+- 后续其他数据源 Adapter
+
+上游 API 变化时尽量只修改这里。
+
+### `fetcher`
+
+负责：
+
+- 按日期或时间窗口抓取
+- 分页
+- 请求重试
+- API 错误分类
+
+### `normalizer`
+
+负责：
+
+- 把不同 Zepp 响应转换为统一内部数据结构
+- 单位统一
+- 时间统一
+- 数据来源标记
+- 不擅自重新计算 Zepp 专有指标
+
+### `sync`
+
+负责：
+
+- 首次 30 天同步
+- 增量同步
+- overlap 回看
+- 去重与 UPSERT
+- 定期清理
+
+### `storage`
+
+负责：
+
+- SQLite
+- Schema migration
+- 查询
+- retention
+
+### `dashboard`
+
+负责：
+
+- 本地可视化
+- 不直接调用 Zepp Cloud
+- 只读取统一查询层
+
+### `api` / `mcp`
+
+后期增加：
+
+- REST
+- MCP
+- 与 Dashboard 共用相同查询服务
+
+---
+
+## 3. 推荐技术栈
+
+### 桌面端
+
+- Tauri 2
+- Vue 3
+- TypeScript
+- Vite
+- Apache ECharts
+
+### 后端核心
+
+- Rust
+- `reqwest`：HTTP
+- `rusqlite`：SQLite
+- `serde`：数据结构
+- Tauri commands：本地前后端通信
+
+### 数据库
+
+MVP 直接使用 SQLite。
+
+原因：
+
+- 单用户
+- 本地使用
+- 只保存最近约 30 天
+- 即使包含分钟级心率、运动样本和 GPS，也远未达到需要 PostgreSQL 或时序数据库的规模
+- 一个数据库文件便于备份、迁移和查询
+- AI 与 Dashboard 的典型查询都很适合 SQL
+
+Zepp token 使用 Windows Credential Manager 或等价系统凭据存储。
+
+SQLCipher 不作为个人 MVP 的硬依赖。准备公开分发时再评估数据库加密、签名、SBOM 和更完整的安全体系。
+
+### 本地目录
+
+建议：
+
+```text
+%LOCALAPPDATA%/ZeppBridge/
+├── zepp.db
+├── cache/
+└── logs/
+```
+
+源码仓库必须忽略：
+
+```text
+data/
+*.db
+*.har
+*.token
+.env
+```
+
+---
+
+## 4. Zepp 数据获取与认证
+
+### MVP 数据源
+
+第一版优先通过 Zepp 私有 Cloud API 获取数据，并尽量复用社区已经验证的成果，例如：
+
+- `zepp-health-cli`
+- 其他已验证 Zepp 数据导出项目
+
+目标是尽快完成“真实账号数据可用”，不重新从 Android APK、BLE 或本地数据库开始逆向。
+
+### 认证
+
+MVP 允许用户导入：
+
+```text
+app_token
+user_id
+region_host
+```
+
+程序负责：
+
+- 校验 token
+- 校验 region
+- 保存必要认证信息
+- 401 / 403 时提示重新授权
+
+不收集 Zepp 密码。
+
+### 开工时的小规模验证
+
+正式开发前先做一个很小的技术 Spike，但它只是 MVP 的前置验证，不单独发展成大型研究工具。
+
+首先验证：
+
+- Heart Rate
+- Sleep
+- Workout
+- HRV
+
+随后尝试：
+
+- SpO₂
+- Stress
+- Readiness
+- BioCharge
+- HybridCharge
+- Training Load
+- VO₂max
+- GPS
+
+至少选一个 Helio Strap 与 T-Rex 3 在同一天使用的日期，与 Zepp App 对照。
+
+只需要回答：
+
+1. 数据能否稳定读取？
+2. 时间和数值能否与 App 基本对应？
+3. 返回数据是否包含 device_id / device source？
+4. Zepp App 中的多设备融合结果能否直接在 Cloud 返回值中找到？
+5. 哪些指标当前 unavailable / unverified？
+
+只要核心数据能够稳定读取，就进入正式 SQLite 与 Dashboard 开发。
+
+HybridCharge、个别专有指标或少数融合边缘情况暂时未确认，不阻塞 MVP。
+
+---
+
+## 5. 多设备数据策略
+
+ZeppBridge 不默认重新实现 Zepp 的多设备融合算法。
+
+### 第一优先级：Zepp 用户级结果
+
+如果真实数据证明某条记录已经是 Zepp 的用户级 / 融合结果：
+
+```text
+source_scope = user_fused
+```
+
+直接作为默认结果。
+
+Dashboard、REST 和 MCP 都优先读取这类数据。
+
+### 第二类：明确设备级数据
+
+如果某条记录明确属于：
+
+- Helio Strap
+- T-Rex 3
+
+则：
+
+```text
+source_scope = device
+```
+
+保存设备来源。
+
+MVP 不做简单相加、平均或覆盖。
+
+### 第三类：来源暂时未知
+
+无法确认时：
+
+```text
+source_scope = unknown
+```
+
+数据仍可以进入本地并展示，但不宣称它已经经过 Zepp 官方融合。
+
+### 专有指标
+
+以下数据优先保存 Zepp 官方结果：
+
+- Readiness
+- BioCharge
+- HybridCharge
+- VO₂max
+- Training Load
+- 其他 Zepp 派生分数
+
+ZeppBridge 不自行用原始心率、HRV 等重新模拟这些指标。
+
+### 设备角色
+
+默认使用习惯可以记录为：
+
+```text
+Helio Strap = day, sleep
+T-Rex 3     = workout
+```
+
+这只用于解释数据和未来可能的 fallback，不覆盖 Zepp 已经提供的用户级结果。
+
+---
+
+## 6. SQLite Schema
+
+MVP 保持简单。
+
+### `source_accounts`
+
+保存：
+
+- source_type
+- region_host
+- external_user_hash
+- auth_state
+- capabilities
+
+不保存明文 token。
+
+### `raw_records`
+
+用于短期保存 Zepp 原始响应。
+
+建议字段：
+
+```text
+id
+stream
+source_key
+source_scope
+device_id
+start_utc
+end_utc
+payload
+payload_hash
+fetched_at
+```
+
+Raw 的意义：
+
+- 调试
+- endpoint 变化时重新分析
+- parser 修正后重新标准化
+
+MVP 不需要复杂完整 provenance 系统。
+
+### `metric_samples`
+
+用于：
+
+- heart_rate
+- resting_hr
+- HRV
+- SpO₂
+- stress
+- 其他时间序列
+
+主要字段：
+
+```text
+metric
+timestamp
+value
+unit
+source_scope
+device_id
+raw_record_id
+```
+
+### `daily_metrics`
+
+用于：
+
+- Readiness
+- BioCharge
+- HybridCharge
+- Training Load
+- VO₂max
+- steps
+- calories
+- 其他每日汇总
+
+### `sleep_sessions`
+
+保存：
+
+- start_time
+- end_time
+- score
+- duration
+- deep
+- light
+- REM
+- awake
+- source_scope
+
+### `sleep_stages`
+
+保存睡眠阶段时间线。
+
+### `workouts`
+
+保存运动摘要：
+
+- workout_id
+- type
+- start / end
+- distance
+- calories
+- avg_hr
+- max_hr
+- training_load
+- VO₂max
+- source/device
+
+### `workout_samples`
+
+保存运动中的高频数据：
+
+- timestamp
+- heart_rate
+- pace / speed
+- cadence
+- altitude
+- 其他运动指标
+
+### `route_points`
+
+保存 GPS：
+
+- workout_id
+- timestamp
+- latitude
+- longitude
+- altitude
+
+不要把所有逐秒运动数据和 GPS 长期塞入一个巨大 JSON 字段。
+
+### `sync_state`
+
+保存：
+
+- stream
+- last_sync
+- cursor
+- status
+- error
+- needs_reauth
+
+根据真实数据需要，再考虑增加 `devices` 或更复杂的映射表。
+
+---
+
+## 7. 同步与去重
+
+### 首次同步
+
+第一次同步：
+
+```text
+最近 30 天 → 现在
+```
+
+### 增量同步
+
+不能只从 `last_sync` 之后继续拉取，因为 Zepp 可能会在之后补算睡眠、恢复状态或派生分数。
+
+因此采用简单 overlap：
+
+- 连续数据与运动：回看约 72 小时
+- 睡眠和每日派生指标：回看约 7 天
+- 提供“重新同步最近 30 天”入口
+
+后续如果发现实际 API 行为更稳定，可以再调整窗口。
+
+### 去重
+
+优先使用：
+
+1. Zepp 官方稳定 ID
+2. Zepp source key
+3. 无稳定 ID 时生成确定性 fingerprint
+
+同一 key：
+
+- 数据完全相同：忽略
+- payload 改变：视为 Zepp 后续修订并更新
+
+### Retention
+
+Canonical 健康数据默认保留 30 天。
+
+Raw 数据开发阶段可保留 30 天便于调试，产品稳定后缩短到约 7 天。
+
+清理依据必须是健康记录的实际时间：
+
+```text
+timestamp
+start_time
+local_date
+```
+
+不能只依据 `created_at`。
+
+清理统一在同步完成后执行，不在每条 INSERT 上触发。
+
+定期：
+
+- WAL checkpoint
+- incremental vacuum
+
+---
+
+## 8. Dashboard
+
+核心数据一旦已经能够稳定进入 SQLite，就开始做 Dashboard。
+
+不等待所有 Zepp 指标全部研究完成。
+
+### Overview
+
+展示：
+
+- 今日心率
+- 静息心率
+- 昨晚睡眠
+- HRV
+- Readiness
+- BioCharge / HybridCharge（有则显示）
+- 最近运动
+- Training Load
+- VO₂max
+
+### Recovery / Sleep
+
+展示：
+
+- HRV
+- Resting HR
+- Sleep duration
+- Sleep stages
+- Sleep score
+- Stress
+- SpO₂
+
+### Workouts
+
+展示：
+
+- 最近 30 天运动
+- 距离
+- 时长
+- 配速
+- 心率
+- 心率区间
+- Training Load
+- VO₂max
+- GPS 本地轨迹
+
+### Data Status
+
+展示：
+
+- 最后同步时间
+- token 状态
+- capability
+- missing / unverified 指标
+- `user_fused / device / unknown`
+- 设备来源
+- 重新同步
+- 重新授权
+
+这样即使某个高级指标暂时拿不到，用户依然能够正常使用 ZeppBridge。
+
+---
+
+## 9. REST API 与 MCP
+
+数据同步和 Dashboard 稳定后再增加 AI 接口。
+
+REST 与 MCP 共用同一个本地查询层。
+
+### REST
+
+仅监听：
+
+```text
+127.0.0.1
+```
+
+默认关闭。
+
+最小接口：
+
+```text
+GET  /v1/status
+GET  /v1/metrics/{metric}
+GET  /v1/sleep
+GET  /v1/workouts
+GET  /v1/workouts/{id}
+POST /v1/sync
+```
+
+禁止任意 SQL。
+
+### MCP
+
+本地 stdio，只读。
+
+建议工具：
+
+```text
+get_health_summary
+get_metric_series
+list_sleep_sessions
+list_workouts
+get_workout_detail
+get_data_quality
+get_sync_status
+```
+
+AI 默认读取标准化后的 SQLite 数据。
+
+AI 不直接持有：
+
+- Zepp token
+- Zepp Cloud endpoint
+- Raw API 凭据
+
+返回结果应包含必要的：
+
+- 数据时间范围
+- 最后更新时间
+- source_scope
+- coverage
+- quality / missing 信息
+
+---
+
+## 10. MVP 开发阶段
+
+### Phase 0：Zepp Cloud Spike
+
+目标：
+
+证明自己的 Zepp 账号能够读取真实数据。
+
+完成：
+
+- token/session 导入
+- region 验证
+- 心率
+- 睡眠
+- HRV
+- 一条运动
+- GPS（若已有运动）
+- 尝试 Readiness / BioCharge / HybridCharge / Training Load / VO₂max
+- 至少一个 Helio Strap + T-Rex 3 同日场景对照
+
+只要主要数据能够稳定读取，就进入 Phase 1。
+
+### Phase 1：同步与 SQLite
+
+实现：
+
+- auth
+- Zepp Connector
+- Data Fetcher
+- Normalizer
+- SQLite
+- Sync Scheduler
+- 30 天首次同步
+- overlap 增量同步
+- UPSERT / 去重
+- retention
+- 基础错误处理
+
+验收：
+
+真实 Zepp 数据能够稳定保存在本地，重复同步不会产生明显重复。
+
+### Phase 2：Dashboard
+
+实现：
+
+- Overview
+- Recovery / Sleep
+- Workouts
+- Data Status
+
+验收：
+
+能够用漂亮、清晰的方式查看自己最近 30 天真实 Zepp 数据。
+
+### Phase 3：REST + MCP
+
+实现：
+
+- 本地只读 Query Service
+- REST
+- MCP
+
+验收：
+
+AI 能读取与 Dashboard 完全相同的本地数据。
+
+### Phase 4：更多数据源
+
+根据需要增加：
+
+- Zepp 官方数据归档
+- Gadgetbridge
+- Health Connect
+- 正式 Zepp OAuth
+- 其他穿戴设备
+
+都通过 Adapter 接入，不重写上层产品。
+
+### Phase 5：公开发布
+
+准备真正给别人使用时，再加入：
+
+- SQLCipher
+- 安装包签名
+- 自动更新
+- SBOM
+- GitHub Actions Release
+- NSIS / portable ZIP
+- 更完善的 Credential Manager
+- 隐私与安全文档
+- Zepp 非官方连接器声明
+- 干净 Windows VM 验收
+
+---
+
+## 11. 测试重点
+
+MVP 优先测试会真正影响可靠性的内容：
+
+- token 过期
+- region 错误
+- 401 / 403 / 404 / 429
+- 网络失败
+- Zepp 字段变化
+- 分页
+- 重复同步
+- Zepp 后续修订
+- 30 天边界
+- 跨午夜睡眠
+- 午睡
+- 两设备同日使用
+- workout 重复
+- workout 与 GPS 关联
+- unavailable / unverified 指标
+- `user_fused / device / unknown`
+
+保留少量脱敏 fixture，用于 parser 回归测试。
+
+日志中不得包含：
+
+- Zepp 密码
+- token
+- 完整请求头
+- HAR
+- 完整健康 payload
+- 不必要的精确 GPS
+
+---
+
+## 12. 风险与降级策略
+
+### Zepp 私有 API 改变
+
+通过 Adapter 隔离。
+
+Dashboard、SQLite 查询和 MCP 不直接依赖 Zepp endpoint。
+
+如果某个 endpoint 暂时失效：
+
+- 标记 capability unavailable
+- 保留其他可用数据
+- 更新 Zepp Connector
+- 必要时参考社区逆向项目
+
+### Token 过期
+
+检测 401 / 403。
+
+提示重新导入 token/session。
+
+MVP 不追求复杂一键登录。
+
+### 多设备融合不明确
+
+优先使用已确认的 Zepp 用户级结果。
+
+设备级数据不自动相加或平均。
+
+无法确认就标记 `unknown`。
+
+不让融合研究阻塞整个 MVP。
+
+### 专有指标暂时缺失
+
+Readiness、BioCharge、HybridCharge、Training Load、VO₂max 等某一项拿不到时：
+
+- 标记 unavailable / unverified
+- Dashboard 隐藏或解释
+- 后续补充
+
+不伪造结果。
+
+### 隐私
+
+默认：
+
+- 全部健康数据保存在本地
+- 无云同步
+- 无遥测
+- REST 默认关闭
+- MCP 只读
+- Zepp 凭据与健康数据库分离
+- AI 只读取用户明确开放的本地接口
+
+---
+
+## 13. MVP 成功标准
+
+ZeppBridge 第一版成功，不要求完整复刻 Zepp App。
+
+只需要做到：
+
+1. 能稳定读取自己最近 30 天的核心 Zepp 数据。
+2. 心率、睡眠、HRV、运动等主要数据能够与 Zepp App 对应。
+3. Helio Strap + T-Rex 3 场景下不自行简单相加造成重复数据。
+4. Zepp 已经提供用户级融合结果时优先使用。
+5. SQLite 能可靠地同步、去重、修订和自动清理。
+6. Dashboard 能清晰查看最近 30 天主要健康和运动趋势。
+7. REST / MCP 能让 AI 查询同一份标准化本地数据。
+8. 某些高级指标暂时 unavailable / unverified 时，应用仍然可以正常使用。
+9. Zepp API 以后发生变化时，主要修改 Connector，而不推倒整个应用。
+
+最终产品应该保持一个很简单的心智模型：
+
+> ZeppBridge 不重新发明 Zepp。
+>
+> 它负责把属于用户自己的 Zepp 数据稳定地取回来、整理好、保存在本地，并以人和 AI 都容易使用的方式开放出来。
+
+---
+
+## 14. 2026-08-12 实施状态与门禁
+
+本节是对上面原始计划的状态补充，不改写原计划的架构意图。
+
+### Phase 0：live gate
+
+- **未完成。** 当前没有用户真实 Zepp 凭据、实体手机或多区域/多账号样本，因此真实账号同步、手机安装 CA/代理捕获、Zepp App 对照和 Helio Strap + T-Rex 3 同日验证都必须保留为待验证。尚未在最终 build 上完成 partial capture user ID → 输入 ID → verify → initial sync，也没有真实 Zepp endpoint 同步证据。
+- `band_data` 睡眠 payload、睡眠阶段、GPS/路线、训练详情和 HybridCharge 尚无真实 fixture 证据；代码只在能安全解析时写 canonical，编码 payload 保留 raw 并标记 `unverified`。
+
+### Phase 1：同步与 SQLite
+
+- **代码级完成。** 当前 checkout 已包含真实 Tauri commands、Windows Credential Manager、启动恢复、真实 Zepp endpoint/host 校验、有限 timeout/retry、逐 stream 报告、SQLite migration/WAL/foreign keys、去重、raw provenance 和 retention。CA 私钥使用 `com.zeppbridge.ca` 的数据目录 hash identity 持久化，磁盘只保留 public `.cer/.pem`；stop/restart 不删除 key 或每次生成新证书，legacy `.key` 仅成功迁移后删除。
+- 首次同步窗口为 30 天；增量 command 当前使用 7 天 overlap。没有后台定时调度器。
+- 本机代码与安装烟测门禁已通过：`cargo test`、`npm run build`、Rust fmt/check/clippy 和 `build.bat` 记录见本节末；真实数据验收仍必须经过 Phase 0 live gate。
+
+### Phase 2：Dashboard
+
+- **代码级完成。** Overview、Sleep、Workouts、连接与数据页面已接入 command，包含空值/错误/加载状态、能力/stream 状态表、响应式和可访问性标记。
+- 没有真实数据和实体设备视觉验收，不能宣称四页已经覆盖真实 Zepp 数据。
+
+### Phase 3：REST + MCP
+
+- **未开始。** REST/MCP 是在真实账号同步和 Dashboard 稳定之后的计划项，不是本轮 bug，也没有对应的现有 command、端口或 API 契约。
+
+### Phase 4：更多数据源
+
+- **未开始。** Gadgetbridge、Health Connect、官方归档、正式 OAuth 和其他设备仍通过未来 Adapter 接入。
+
+### Phase 5：公开发布
+
+- **未开始。** Tauri 配置声明 NSIS/MSI bundle 目标，但公开发布还缺安装包签名（当前 EXE/NSIS/MSI 均 Authenticode `NotSigned`，为发布阻碍）、整库加密、自动更新、SBOM、GitHub Actions release、干净 Windows VM 和完整隐私/安全审计。
+- 构建产物目录必须从 `cargo metadata` 的 `target_directory` 推导；不要把某个仓库子目录写成固定输出路径。
+
+### 最终交付门禁
+
+本次交付门禁记录如下：
+
+- `npm run build` exit 0，Vite 处理 47 modules；
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check` exit 0；
+- `cargo check --manifest-path src-tauri/Cargo.toml --locked --all-targets` exit 0，无 warnings；
+- `cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings` exit 0；
+- `cargo test --manifest-path src-tauri/Cargo.toml --locked --jobs 1`：46 passed，0 failed；
+- `cmd.exe /d /c build.bat` exit 0，生成 EXE/NSIS/MSI；三者均 NotSigned，路径和 SHA256 见 [COMPLETION_REPORT.md](COMPLETION_REPORT.md)；
+- NSIS 静默覆盖安装 exit 0；已安装 EXE 的 AppID、标题、亮暗主题、小窗口、局域网代理、DER 证书 URL、取消释放 listener 和 CA 凭据复用均已 smoke 验证。公开仓库不保留本机地址、证书指纹或真实账号样本；运行目录无 key file、Credential target 存在，警告去重后 1 次；
+- 上述是电脑本机与已安装 EXE 的证据，不是实体手机或真实 Zepp 账号 live gate；真实账号同步、手机 CA/代理和区域/设备对照仍未完成。
