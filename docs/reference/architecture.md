@@ -1,6 +1,6 @@
 # ZeppBridge 架构摘要
 
-本文描述 v0.2.x 的产品边界与当前实现。可复现的安装验收范围见 [COMPLETION_REPORT.md](COMPLETION_REPORT.md)，已知问题见 [REPAIR_AUDIT.md](REPAIR_AUDIT.md)。
+本文描述 v0.2.x 的产品边界与当前实现。使用入口见项目 [README](../../README.md)，工程门禁见 [开发文档](../development/development.md)。
 
 ## 产品边界
 
